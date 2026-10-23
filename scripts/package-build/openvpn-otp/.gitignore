@@ -1,6 +1,1 @@
-openvpn-otp/
-*.buildinfo
-*.build
-*.changes
-*.deb
-*.dsc
+/openvpn-otp/

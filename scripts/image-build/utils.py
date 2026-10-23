@@ -25,6 +25,9 @@ import shutil
 import defaults
 import vyos
 
+from vyos.defaults import directories
+
+
 def check_build_config():
     if not os.path.exists(defaults.BUILD_CONFIG):
         print("Build config file ({file}) does not exist".format(file=defaults.BUILD_CONFIG))
@@ -82,3 +85,10 @@ def cmd(command):
     res = vyos.utils.process.call(command, shell=True)
     if res > 0:
         raise OSError(f"Command '{command}' failed")
+
+def rc_cmd(command):
+    code, out = vyos.utils.process.rc_cmd(command, shell=True)
+    if code > 0:
+        raise OSError(f"Command '{command}' failed")
+    else:
+        return out

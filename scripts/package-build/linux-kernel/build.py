@@ -18,6 +18,7 @@
 import datetime
 import glob
 import shutil
+import sys
 import toml
 import os
 import subprocess
@@ -37,6 +38,7 @@ def ensure_dependencies(dependencies: list) -> None:
         return
 
     print("I: Ensure Debian build dependencies are met")
+    run(['sudo', 'apt-get', 'update'], check=True)
     run(['sudo', 'apt-get', 'install', '-y'] + dependencies, check=True)
 
 
@@ -59,8 +61,56 @@ def clone_or_update_repo(repo_dir: Path, scm_url: str, commit_id: str) -> None:
         run(['git', 'checkout', commit_id], cwd=repo_dir, check=True)
         #run(['git', 'pull'], cwd=repo_dir, check=True)
     else:
-        run(['git', 'clone', scm_url, str(repo_dir)], check=True)
-        run(['git', 'checkout', commit_id], cwd=repo_dir, check=True)
+        try:
+            run(['git', 'clone', scm_url, str(repo_dir)], check=True)
+            run(['git', 'checkout', commit_id], cwd=repo_dir, check=True)
+        except CalledProcessError as e:
+            print(f"Failed to clone or checkout: {e}")
+            sys.exit(1)
+
+
+def create_tarball(package_name, source_dir=None):
+    """Creates a .tar.gz archive of the specified directory.
+
+    Args:
+        package_name (str): The name of the package. This will also be the name of the output tarball.
+        source_dir (str, optional): The directory to be archived. If not provided, defaults to `package_name`.
+
+    Raises:
+        FileNotFoundError: If the specified `source_dir` does not exist.
+        Exception: If an error occurs during tarball creation.
+
+    Example:
+        >>> create_tarball("linux-6.6.56")
+        I: Tarball created: linux-6.6.56.tar.gz
+
+        >>> create_tarball("my-package", "/path/to/source")
+        I: Tarball created: my-package.tar.gz
+    """
+    # Use package_name as the source directory if source_dir is not provided
+    source_dir = source_dir or package_name
+    output_tarball = f"{package_name}.tar.gz"
+
+    # Check if the source directory exists
+    if not os.path.isdir(source_dir):
+        raise FileNotFoundError(f"Directory '{source_dir}' does not exist.")
+
+    base_dir = os.path.dirname(source_dir) or '.'
+    dir_name = os.path.basename(source_dir)
+
+    # Create the tarball
+    try:
+        subprocess.run([
+            'tar',
+            f'--exclude={dir_name}/.git',
+            f'--exclude={dir_name}/.github',
+            '-czf', output_tarball,
+            '-C', base_dir,
+            dir_name
+        ], check=True)
+        print(f"I: Tarball created: {output_tarball}")
+    except subprocess.CalledProcessError as e:
+        print(f"I: Failed to create tarball for {package_name}: {e}")
 
 
 def build_package(package: dict, dependencies: list) -> None:
@@ -78,30 +128,41 @@ def build_package(package: dict, dependencies: list) -> None:
         # Clone or update the repository
         #clone_or_update_repo(repo_dir, package['scm_url'], package['commit_id'])
 
-        # Ensure dependencies
-        #ensure_dependencies(dependencies)
-
         # Prepare the package if required
         #if package.get('prepare_package', False):
         #    prepare_package(repo_dir, package.get('install_data', ''))
 
         # Execute the build command
         if package['build_cmd'] == 'build_kernel':
-            build_kernel(package['kernel_version'])
+            source_dir = build_kernel(package['kernel_version'])
+            create_tarball(f'{package["name"]}-{package["kernel_version"]}', source_dir)
         elif package['build_cmd'] == 'build_linux_firmware':
             build_linux_firmware(package['commit_id'], package['scm_url'])
-        elif package['build_cmd'] == 'build_accel_ppp':
-            build_accel_ppp(package['commit_id'], package['scm_url'])
+            create_tarball(f'{package["name"]}-{package["commit_id"]}', f'{package["name"]}')
+        elif package['build_cmd'] == 'build_accel_ppp_ng':
+            build_accel_ppp_ng(package['commit_id'], package['scm_url'])
+            create_tarball(f'{package["name"]}-{package["commit_id"]}', f'{package["name"]}')
         elif package['build_cmd'] == 'build_intel_qat':
             build_intel_qat()
+        elif package['build_cmd'] == 'build_intel_igb':
+            build_intel(package['name'], package['commit_id'], package['scm_url'])
         elif package['build_cmd'] == 'build_intel_ixgbe':
-            build_intel_ixgbe()
+            build_intel(package['name'], package['commit_id'], package['scm_url'])
         elif package['build_cmd'] == 'build_intel_ixgbevf':
-            build_intel_ixgbevf()
+            build_intel(package['name'], package['commit_id'], package['scm_url'])
+        elif package['build_cmd'] == 'build_mellanox_ofed':
+            build_mellanox_ofed()
+        elif package['build_cmd'] == 'build_realtek_r8126':
+            build_realtek_r8126()
+        elif package['build_cmd'] == 'build_realtek_r8152':
+            build_realtek_r8152()
         elif package['build_cmd'] == 'build_jool':
             build_jool()
+        elif package['build_cmd'] == 'build_ipt_netflow':
+            build_ipt_netflow(package['commit_id'], package['scm_url'])
         elif package['build_cmd'] == 'build_openvpn_dco':
             build_openvpn_dco(package['commit_id'], package['scm_url'])
+            create_tarball(f'{package["name"]}-{package["commit_id"]}', f'{package["name"]}')
         elif package['build_cmd'] == 'build_nat_rtsp':
             build_nat_rtsp(package['commit_id'], package['scm_url'])
         else:
@@ -113,17 +174,6 @@ def build_package(package: dict, dependencies: list) -> None:
         # Clean up repository directory
         # shutil.rmtree(repo_dir, ignore_errors=True)
         pass
-
-
-def cleanup_build_deps(repo_dir: Path) -> None:
-    """Clean up build dependency packages"""
-    try:
-        if repo_dir.exists():
-            for file in glob.glob(str(repo_dir / '*build-deps*.deb')):
-                os.remove(file)
-            print("Cleaned up build dependency packages")
-    except Exception as e:
-        print(f"Error cleaning up build dependencies: {e}")
 
 
 def copy_packages(repo_dir: Path) -> None:
@@ -141,17 +191,22 @@ def merge_dicts(defaults, package):
     return {**defaults, **package}
 
 
-def build_kernel(kernel_version):
+def build_kernel(kernel_version) -> str:
     """Build the Linux kernel"""
-    run(['gpg2', '--locate-keys', 'torvalds@kernel.org', 'gregkh@kernel.org'], check=True)
-    run(['curl', '-OL', f'https://www.kernel.org/pub/linux/kernel/v6.x/linux-{kernel_version}.tar.xz'], check=True)
-    run(['curl', '-OL', f'https://www.kernel.org/pub/linux/kernel/v6.x/linux-{kernel_version}.tar.sign'], check=True)
-    # Using pipes to handle decompression and verification
-    with subprocess.Popen(['xz', '-cd', f'linux-{kernel_version}.tar.xz'], stdout=subprocess.PIPE) as proc_xz:
-        run(['gpg2', '--verify', f'linux-{kernel_version}.tar.sign', '-'], stdin=proc_xz.stdout, check=True)
-    run(['tar', 'xf', f'linux-{kernel_version}.tar.xz'], check=True)
-    os.symlink(f'linux-{kernel_version}', 'linux')
+    source_dir = 'linux' # Git source repo name - preferred over TAR
+    if not os.path.exists(source_dir):
+        run(['gpg2', '--locate-keys', 'torvalds@kernel.org', 'gregkh@kernel.org'], check=True)
+        run(['curl', '-OL', f'https://www.kernel.org/pub/linux/kernel/v6.x/linux-{kernel_version}.tar.xz'], check=True)
+        run(['curl', '-OL', f'https://www.kernel.org/pub/linux/kernel/v6.x/linux-{kernel_version}.tar.sign'], check=True)
+        # Using pipes to handle decompression and verification
+        with subprocess.Popen(['xz', '-cd', f'linux-{kernel_version}.tar.xz'], stdout=subprocess.PIPE) as proc_xz:
+            run(['gpg2', '--verify', f'linux-{kernel_version}.tar.sign', '-'], stdin=proc_xz.stdout, check=True)
+        run(['tar', 'xf', f'linux-{kernel_version}.tar.xz'], check=True)
+        source_dir = f'linux-{kernel_version}'
+        os.symlink(source_dir, 'linux')
+
     run(['./build-kernel.sh'], check=True)
+    return(source_dir)
 
 
 def build_linux_firmware(commit_id, scm_url):
@@ -161,11 +216,11 @@ def build_linux_firmware(commit_id, scm_url):
     run(['./build-linux-firmware.sh'], check=True)
 
 
-def build_accel_ppp(commit_id, scm_url):
-    """Build accel-ppp"""
-    repo_dir = Path('accel-ppp')
+def build_accel_ppp_ng(commit_id, scm_url):
+    """Build accel-ppp-ng"""
+    repo_dir = Path('accel-ppp-ng')
     clone_or_update_repo(repo_dir, scm_url, commit_id)
-    run(['./build-accel-ppp.sh'], check=True)
+    run(['./build-accel-ppp-ng.sh'], check=True)
 
 
 def build_intel_qat():
@@ -173,20 +228,37 @@ def build_intel_qat():
     run(['./build-intel-qat.sh'], check=True)
 
 
-def build_intel_ixgbe():
-    """Build Intel IXGBE"""
-    run(['./build-intel-ixgbe.sh'], check=True)
+def build_intel(driver_name: str, commit_id: str, scm_url: str):
+    """Build Intel driver from Git repository"""
+    repo_dir = Path(f'ethernet-linux-{driver_name}')
+    clone_or_update_repo(repo_dir, scm_url, commit_id)
+    run(['./build-intel-nic.sh', driver_name], check=True)
 
 
-def build_intel_ixgbevf():
-    """Build Intel IXGBEVF"""
-    run(['./build-intel-ixgbevf.sh'], check=True)
+def build_mellanox_ofed():
+    """Build Mellanox OFED"""
+    run(['sudo', './build-mellanox-ofed.sh'], check=True)
+
+
+def build_realtek_r8126():
+    """Build Realtek r8126"""
+    run(['./build-realtek-r8126.py'], check=True)
+
+
+def build_realtek_r8152():
+    """Build Realtek r8152"""
+    run(['./build-realtek-r8152.py'], check=True)
 
 
 def build_jool():
     """Build Jool"""
     run(['echo y | ./build-jool.py'], check=True, shell=True)
 
+def build_ipt_netflow(commit_id, scm_url):
+    """Build ipt_NETFLOW"""
+    repo_dir = Path('ipt-netflow')
+    clone_or_update_repo(repo_dir, scm_url, commit_id)
+    run(['./build-ipt-netflow.sh'], check=True, shell=True)
 
 def build_openvpn_dco(commit_id, scm_url):
     """Build OpenVPN DCO"""
@@ -207,6 +279,7 @@ if __name__ == '__main__':
     arg_parser = ArgumentParser()
     arg_parser.add_argument('--config', default='package.toml', help='Path to the package configuration file')
     arg_parser.add_argument('--packages', nargs='+', help='Names of packages to build (default: all)', default=[])
+    arg_parser.add_argument('--install-dependencies', '-i', help='Only install build dependencies', action='store_true')
     args = arg_parser.parse_args()
 
     # Load package configuration
@@ -216,6 +289,13 @@ if __name__ == '__main__':
     # Extract defaults and packages
     with open(defaults_path, 'r') as file:
         defaults = toml.load(file)
+
+    # Load global dependencies
+    global_dependencies = config.get('dependencies', {}).get('packages', [])
+    if global_dependencies:
+        ensure_dependencies(global_dependencies)
+        if args.install_dependencies:
+            exit(0)
 
     packages = config['packages']
 
@@ -231,9 +311,6 @@ if __name__ == '__main__':
 
         # Build the package
         build_package(package, dependencies)
-
-        # Clean up build dependency packages after build
-        cleanup_build_deps(Path(package['name']))
 
         # Copy generated .deb packages to parent directory
         copy_packages(Path(package['name']))

@@ -7,14 +7,15 @@ debian_distribution = "bookworm"
 debian_mirror = "http://deb.debian.org/debian"
 debian_security_mirror = "http://deb.debian.org/debian-security"
 
-debian_archive_areas = "main contrib non-free non-free-firmware"
+debian_archive_areas = "main,contrib,non-free,non-free-firmware"
 
 vyos_mirror = "https://packages.vyos.net/repositories/circinus"
 
 vyos_branch = "circinus"
 release_train = "circinus"
 
-kernel_version = "6.6.54"
+kernel_version = "6.6.128"
+kernel_flavor = "vyos"
 bootloaders = "syslinux,grub-efi"
 
 squashfs_compression_type = "xz -Xbcj x86 -b 256k -always-use-fragments -no-recovery"
