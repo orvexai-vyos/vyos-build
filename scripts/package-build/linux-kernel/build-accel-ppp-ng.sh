@@ -20,7 +20,8 @@ fi
 
 # Build VPP as we need VPP libraries
 cd ../vpp/
-./build.py
+# orvex: the configuration with pinned sources, as package.toml names private ones
+./build.py --config package.orvex.toml
 cd ${CWD}
 
 if [ ! -d ${VPP_LIB_CHECK_PATH} ]; then

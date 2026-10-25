@@ -13,7 +13,7 @@ ARCH=$(dpkg --print-architecture)
 # Uncomment SALT_REPO and ALT_VERSION variable to build Salt manually
 #SALT_REPO="https://github.com/saltstack/salt.git"
 #SALT_VERSION="v3006.19"
-TOOLS_REPO="https://github.com/saltstack/python-tools-scripts"
+TOOLS_REPO="https://github.com/orvexai-vyos/python-tools-scripts"
 
 # Check this page to find a correct relenv/python combination.
 # https://github.com/saltstack/relenv/releases

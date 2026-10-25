@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+#
+# Build the VyOS packages of a Stream release from source, without the private
+# VyOS package repository. Inputs are pinned in lock.toml.
+#
+#   scripts/orvex/orvex check            check the lock without downloading the release
+#   scripts/orvex/orvex fetch            download and verify the release, import source trees
+#   scripts/orvex/orvex build [PKG...]   build packages in the build container
+#   scripts/orvex/orvex iso              assemble the package repository, build the ISO
+#
+# Everything is written below build/orvex.
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+LOCK = tomllib.loads((ROOT / 'scripts/orvex/lock.toml').read_text())
+WORK = ROOT / 'build/orvex'
+PKG_DIR = ROOT / 'scripts/package-build'
+IMAGE = LOCK['docker']['image']
+# Path of the repository inside the build container
+VYOS = '/vyos'
+
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, check=True, **kwargs)
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fetch_release() -> Path:
+    stream = LOCK['stream']
+    dst = WORK / 'cache' / os.path.basename(stream['url'])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if dst.exists() and sha256_of(dst) == stream['sha256']:
+        return dst
+
+    part = dst.with_name(dst.name + '.part')
+    print(f"I: Downloading {stream['url']}")
+    run(['curl', '-fL', '--retry', '5', '--retry-delay', '5', '-C', '-', '-o', str(part), stream['url']])
+    digest = sha256_of(part)
+    if digest != stream['sha256']:
+        part.unlink()
+        sys.exit(f"E: {dst.name} has sha256 {digest}, lock expects {stream['sha256']}")
+    part.rename(dst)
+    return dst
+
+
+def extract_trees(release: Path, wanted: set) -> None:
+    """Extract the named top-level trees of vyos_tarballs.tar.gz in one pass"""
+    dest = WORK / 'sources/trees'
+    missing = {t for t in wanted if not (dest / t).is_dir()}
+    if not missing:
+        return
+
+    print(f"I: Extracting {len(missing)} source trees from {release.name}")
+    dest.mkdir(parents=True, exist_ok=True)
+    found = set()
+    with tarfile.open(release, 'r|gz') as outer:
+        for member in outer:
+            if not member.name.endswith('vyos-tarballs/vyos_tarballs.tar.gz'):
+                continue
+            with tarfile.open(fileobj=outer.extractfile(member), mode='r|gz') as inner:
+                for entry in inner:
+                    top = entry.name.removeprefix('./').split('/')[0]
+                    if top in missing:
+                        inner.extract(entry, dest, filter='data')
+                        found.add(top)
+            break
+
+    if found != missing:
+        sys.exit(f"E: not in the release: {', '.join(sorted(missing - found))}")
+
+
+def git(cwd: Path, *args, env=None) -> str:
+    out = run(['git', *args], cwd=cwd, env=env, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def import_tree(name: str, tree: str) -> str:
+    """Make a git repository out of a source tree and return its commit id.
+
+    The tree has no history. The commit is made reproducible, so the same
+    release always yields the same id.
+    """
+    src = WORK / 'sources/trees' / tree
+    entries = list(src.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        src = entries[0]
+
+    dst = WORK / 'sources/git' / name
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, symlinks=True)
+
+    # Packages that were built in these trees leave their results behind
+    for pattern in ('*.deb', '*.buildinfo', '*.changes'):
+        for leftover in dst.glob(pattern):
+            leftover.unlink()
+
+    date = f"{LOCK['stream']['epoch']} +0000"
+    env = {**os.environ,
+           'GIT_AUTHOR_NAME': 'orvex', 'GIT_AUTHOR_EMAIL': 'orvex@localhost', 'GIT_AUTHOR_DATE': date,
+           'GIT_COMMITTER_NAME': 'orvex', 'GIT_COMMITTER_EMAIL': 'orvex@localhost', 'GIT_COMMITTER_DATE': date}
+    git(dst, 'init', '-q')
+    git(dst, 'add', '-A', '-f')
+    git(dst, 'commit', '-q', '-m', f"Import {tree} from VyOS Stream {LOCK['stream']['release']}", env=env)
+    return git(dst, 'rev-parse', 'HEAD')
+
+
+def prepare_sources() -> dict:
+    """Return {package name: (scm_url, commit_id)} for everything not taken from upstream as pinned"""
+    trees = dict(LOCK['tree'])
+    trees.update({n: e['tree'] for n, e in LOCK['extra'].items() if 'tree' in e})
+
+    release = fetch_release()
+    extract_trees(release, set(trees.values()))
+
+    sources = {}
+    for name, tree in trees.items():
+        sources[name] = (f"file://{VYOS}/build/orvex/sources/git/{name}", import_tree(name, tree))
+    for name, pin in LOCK['git'].items():
+        sources[name] = (mirrored(pin['url']), pin['commit'])
+    for name, extra in LOCK['extra'].items():
+        if 'git' in extra:
+            sources[name] = (mirrored(extra['git']), extra['commit'])
+    return sources
+
+
+def mirrored(url: str) -> str:
+    """The copy of an upstream repository in the mirror organisation, or the URL itself"""
+    key = re.sub(r'(\.git)?/?$', '', re.sub(r'^\w+://', '', url)).lower()
+    name = LOCK['mirror']['repos'].get(key)
+    return f"{LOCK['mirror']['org']}/{name}.git" if name else url
+
+
+def render_config(text: str, sources: dict) -> str:
+    """Replace scm_url and commit_id of the package.toml entries that have a pinned source,
+    send the others to the mirror, and add the pre_build_hook the lock has for them"""
+    out = []
+    for block in re.split(r'(?m)^(?=\[\[packages\]\])', text):
+        name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', block)
+        if name and name.group(1) in sources:
+            url, commit = sources[name.group(1)]
+            block = re.sub(r'(?m)^scm_url\s*=.*$', f'scm_url = "{url}"', block, count=1)
+            block = re.sub(r'(?m)^commit_id\s*=.*$', f'commit_id = "{commit}"', block, count=1)
+        else:
+            block = re.sub(r'(?m)^scm_url\s*=\s*"([^"]*)"',
+                           lambda m: f'scm_url = "{mirrored(m.group(1))}"', block, count=1)
+        if name and name.group(1) in LOCK['hook']:
+            if re.search(r'(?m)^pre_build_hook\s*=', block):
+                sys.exit(f"E: {name.group(1)} has a pre_build_hook already, cannot add the one of the lock")
+            block = re.sub(r'(?m)^(name\s*=.*)$',
+                           lambda m: f"{m.group(1)}\npre_build_hook = '''\n{LOCK['hook'][name.group(1)]}'''",
+                           block, count=1)
+        out.append(block)
+    return ''.join(out)
+
+
+def extra_config(name: str, sources: dict) -> str:
+    url, commit = sources[name]
+    return f'[[packages]]\nname = "{name}"\ncommit_id = "{commit}"\nscm_url = "{url}"\n'
+
+
+def package_plan(sources: dict) -> list:
+    """List of (name, work dir, config text), in build order"""
+    build = LOCK['build']
+    on_disk = {p.parent.name for p in PKG_DIR.glob('*/package.toml')}
+    unlisted = on_disk - set(build['order']) - set(build['skip'])
+    unknown = set(build['order']) - on_disk
+    if unlisted or unknown:
+        sys.exit(f"E: lock.toml and scripts/package-build disagree: "
+                 f"unlisted {sorted(unlisted)}, missing {sorted(unknown)}")
+
+    plan = []
+    for name in build['order']:
+        text = (PKG_DIR / name / 'package.toml').read_text()
+        plan.append((name, PKG_DIR / name, render_config(text, sources)))
+    for name in build['extra']:
+        plan.append((name, WORK / 'extra' / name, extra_config(name, sources)))
+    return plan
+
+
+def container_digest() -> str:
+    """Digest of the files the build container is made from.
+
+    The image ID is not used: it changes with every build of the image, which
+    would make every package look outdated.
+    """
+    digest = hashlib.sha256()
+    for f in sorted(p for p in (ROOT / 'docker').rglob('*') if p.is_file()):
+        digest.update(str(f.relative_to(ROOT)).encode())
+        digest.update(f.read_bytes())
+    return digest.hexdigest()
+
+
+def inputs_digest(workdir: Path, config: str) -> str:
+    """Digest of everything that decides the result of a package build"""
+    digest = hashlib.sha256()
+    digest.update(container_digest().encode())
+    digest.update(config.encode())
+    files = [PKG_DIR / 'build.py', ROOT / 'data/defaults.toml']
+    if workdir.parent == PKG_DIR:
+        tracked = git(ROOT, 'ls-files', '-z', '--', str(workdir.relative_to(ROOT)))
+        files += [ROOT / f for f in tracked.split('\0') if f]
+    for f in sorted(files):
+        digest.update(f.name.encode())
+        digest.update(f.read_bytes())
+    return digest.hexdigest()
+
+
+def docker_run(command: str, cwd: str, log: Path, cpus: str, memory: str) -> int:
+    args = ['docker', 'run', '--rm', '--privileged', '--cpuset-cpus', cpus, '--memory', memory,
+            '-v', f'{ROOT}:{VYOS}']
+    # In a linked worktree .git is a file naming a directory outside the tree. Some
+    # recipes run git in the tree (the kernel uses it to find the repository root).
+    dotgit = ROOT / '.git'
+    if dotgit.is_file():
+        gitdir = Path(dotgit.read_text().split(':', 1)[1].strip())
+        common = (gitdir / (gitdir / 'commondir').read_text().strip()).resolve()
+        args += ['-v', f'{common}:{common}:ro']
+    args += ['-w', cwd, IMAGE, 'bash', '-i', '-c', command]
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open('w') as f:
+        return subprocess.run(args, stdout=f, stderr=subprocess.STDOUT).returncode
+
+
+def refresh_flat_repository() -> None:
+    """Flat APT repository of every package built so far, used to satisfy build dependencies"""
+    flat = WORK / 'flat'
+    shutil.rmtree(flat, ignore_errors=True)
+    flat.mkdir(parents=True)
+    for deb in sorted((WORK / 'debs').glob('*/*.deb')):
+        try:
+            os.link(deb, flat / deb.name)
+        except OSError:
+            shutil.copy2(deb, flat / deb.name)
+
+    script = ('cd build/orvex/flat && dpkg-scanpackages --multiversion . > Packages '
+              '&& apt-ftparchive release . > Release')
+    log = WORK / 'logs/flat-repository.log'
+    if docker_run(script, VYOS, log, '0', '1g') != 0:
+        sys.exit(f"E: cannot create the build dependency repository, see {log}")
+
+
+def build(args) -> None:
+    sources = prepare_sources()
+    plan = package_plan(sources)
+    names = [p[0] for p in plan]
+    unknown = set(args.packages) - set(names)
+    if unknown:
+        sys.exit(f"E: unknown package(s): {', '.join(sorted(unknown))}")
+
+    (WORK / 'debs').mkdir(parents=True, exist_ok=True)
+    stamps = WORK / 'stamps'
+    stamps.mkdir(parents=True, exist_ok=True)
+    refresh_flat_repository()
+
+    # A recipe can run another package's build.py (the kernel's accel-ppp-ng builds VPP
+    # again), and must then find that package's configuration even if it is up to date
+    for _, workdir, config in plan:
+        if workdir.parent == PKG_DIR:
+            (workdir / 'package.orvex.toml').write_text(config)
+
+    # Only the packages the user named, or all of them
+    for name, workdir, config in plan:
+        if args.packages and name not in args.packages:
+            continue
+
+        digest = inputs_digest(workdir, config)
+        stamp = stamps / f'{name}.json'
+        if not args.force and stamp.exists():
+            recorded = json.loads(stamp.read_text())
+            # A stamp written before a package was listed in [expect] may lack some of its packages
+            built = {p.split('_')[0] for p in recorded['packages']}
+            if recorded['inputs'] == digest and set(LOCK['expect'].get(name, [])) <= built:
+                print(f"I: {name}: up to date")
+                continue
+
+        print(f"I: {name}: building")
+        workdir.mkdir(parents=True, exist_ok=True)
+        if workdir.parent == PKG_DIR:
+            # What an earlier attempt left behind (a patched kernel tree, say) must not be built on
+            subprocess.run(['git', '-C', str(ROOT), 'clean', '-ffdXq', '--', str(workdir)], check=True)
+        for old in workdir.glob('*.deb'):
+            old.unlink()
+        (workdir / 'package.orvex.toml').write_text(config)
+
+        if workdir.parent == PKG_DIR:
+            build_py = './build.py'
+            patches = ''
+        else:
+            build_py = f'{VYOS}/scripts/package-build/build.py'
+            patches = '--patch-dir /nonexistent'
+
+        setup = LOCK.get('env', {}).get(name)
+        command = ("echo 'deb [trusted=yes] file:///vyos/build/orvex/flat ./' "
+                   "| sudo tee /etc/apt/sources.list.d/orvex.list >/dev/null && "
+                   + (f"{setup} && " if setup else '')
+                   + f"python3 {build_py} --config package.orvex.toml {patches}")
+        log = WORK / 'logs' / f'{name}.log'
+        cwd = f"{VYOS}/{workdir.relative_to(ROOT)}"
+        rc = docker_run(command, cwd, log, args.cpus, args.memory)
+
+        # build.py prints a failed build but carries on and exits 0, so its
+        # output is checked as well as the packages that came out
+        debs = [d for d in workdir.glob('*.deb')
+                if '-build-deps_' not in d.name and '-dbgsym_' not in d.name]
+        text = log.read_text()
+        # A failing mk-build-deps is not fatal, some recipes install their own
+        # dependencies afterwards. The packages the lock expects tell if it was.
+        have = {d.name.split('_')[0] for d in debs}
+        lacking = set(LOCK['expect'].get(name, [])) - have
+        failed = re.search(r"(?m)^Failed to build package (?!.*mk-build-deps)", text)
+        if rc != 0 or not debs or lacking or failed:
+            tail = '\n'.join(text.splitlines()[-25:])
+            sys.exit(f"E: {name}: build failed (exit {rc}, {len(debs)} packages, lacking {sorted(lacking)}), see {log}\n{tail}")
+
+        out = WORK / 'debs' / name
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        for deb in debs:
+            shutil.move(deb, out / deb.name)
+        stamp.write_text(json.dumps({'inputs': digest, 'packages': sorted(d.name for d in debs)}, indent=2))
+        print(f"I: {name}: {len(debs)} packages")
+        refresh_flat_repository()
+
+
+def check() -> None:
+    """Cheap checks that need neither the release nor the build container"""
+    # Names with a pinned source are replaced, the values only have to look right
+    sources = {n: ('url', 'commit') for n in [*LOCK['tree'], *LOCK['git'], *LOCK['extra']]}
+    plan = package_plan(sources)
+    for name, _, config in plan:
+        entries = tomllib.loads(config)['packages']
+        if not entries:
+            sys.exit(f"E: {name}: no package entries")
+    print(f"I: {len(plan)} packages in the plan")
+
+    url = LOCK['stream']['url']
+    head = run(['curl', '-sIL', '--max-time', '30', '-o', '/dev/null', '-w', '%{http_code} %header{content-length}', url],
+               capture_output=True, text=True).stdout.split()
+    if head[0] != '200':
+        sys.exit(f"E: {url} answers {head[0]}")
+    print(f"I: release available, {int(head[1]) / 1e9:.2f} GB")
+
+
+def assemble_repository() -> Path:
+    """APT repository of all built packages, in the layout build-vyos-image expects of a VyOS mirror"""
+    repo = WORK / 'repo'
+    shutil.rmtree(repo, ignore_errors=True)
+    pool = repo / 'pool/main'
+    pool.mkdir(parents=True)
+    for deb in sorted((WORK / 'debs').glob('*/*.deb')):
+        try:
+            os.link(deb, pool / deb.name)
+        except OSError:
+            shutil.copy2(deb, pool / deb.name)
+
+    # The codename has to match the pin in data/live-build-config/archives/vyos-dev.pref.chroot
+    release = ' '.join(f'-o APT::FTPArchive::Release::{k}={v}' for k, v in
+                       {'Origin': 'orvex', 'Codename': 'circinus', 'Suite': 'circinus',
+                        'Components': 'main', 'Architectures': 'amd64'}.items())
+    binary = 'dists/circinus/main/binary-amd64'
+    script = (f'cd build/orvex/repo && mkdir -p {binary} '
+              f'&& dpkg-scanpackages --multiversion pool/main > {binary}/Packages '
+              f'&& gzip -9kf {binary}/Packages '
+              f'&& apt-ftparchive {release} release dists/circinus > dists/circinus/Release')
+    log = WORK / 'logs/repository.log'
+    if docker_run(script, VYOS, log, '0', '1g') != 0:
+        sys.exit(f"E: cannot create the package repository, see {log}")
+    return repo
+
+
+def make_iso(args) -> None:
+    """Build the ISO image from the repository"""
+    assemble_repository()
+    version = args.version or f"{LOCK['stream']['release']}-orvex"
+    port = 8321
+
+    # live-build reads the repository from inside its chroot, so serve it over HTTP.
+    # The repository is not signed, the build container is the only one to see it.
+    # build-vyos-image takes the python modules of vyos-1x from a checkout of the branch
+    # named vyos_branch of VYOS1X_REPO_URL (GitHub by default, which has no such branch)
+    with (ROOT / 'data/defaults.toml').open('rb') as f:
+        branch = tomllib.load(f)['vyos_branch']
+    source = WORK / 'sources/git/vyos-1x'
+    git(source, 'branch', '-f', branch, 'HEAD')
+
+    command = (f"export VYOS1X_REPO_URL={VYOS}/build/orvex/sources/git/vyos-1x "
+               "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'; "
+               f"sudo rm -rf {VYOS}/build/vyos-1x; "
+               f"python3 -m http.server {port} --bind 127.0.0.1 --directory {VYOS}/build/orvex/repo "
+               f">/dev/null 2>&1 & cd {VYOS} && sudo --preserve-env ./build-vyos-image "
+               f"--architecture amd64 --build-by orvex@localhost --build-type release --version {version} "
+               f"--vyos-mirror '[trusted=yes] http://127.0.0.1:{port}' generic")
+    log = WORK / 'logs/iso.log'
+    print(f"I: Building the ISO, see {log}")
+    rc = docker_run(command, VYOS, log, args.cpus, args.memory)
+    iso = ROOT / 'build/live-image-amd64.hybrid.iso'
+    if rc != 0 or not iso.exists():
+        tail = '\n'.join(log.read_text().splitlines()[-25:])
+        sys.exit(f"E: ISO build failed (exit {rc}), see {log}\n{tail}")
+
+    out = WORK / 'out'
+    out.mkdir(exist_ok=True)
+    for artifact in (iso, ROOT / 'build/manifest.json'):
+        if artifact.exists():
+            shutil.copy2(artifact, out / artifact.name)
+    print(f"I: {out / iso.name}: sha256 {sha256_of(out / iso.name)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    sub.add_parser('fetch', help='download and verify the release, import source trees')
+    sub.add_parser('check', help='check the lock against the package recipes and the release URL')
+
+    p = sub.add_parser('iso', help='assemble the package repository and build the ISO image')
+    p.add_argument('--version', help='version of the image (default: <release>-orvex)')
+    p.add_argument('--cpus', default='0-11', help='CPUs the build container may use, as for docker --cpuset-cpus')
+    p.add_argument('--memory', default='8g', help='memory limit of the build container')
+
+    p = sub.add_parser('build', help='build packages in the build container')
+    p.add_argument('packages', nargs='*', help='only these packages (default: all)')
+    p.add_argument('--force', action='store_true', help='rebuild even if the inputs are unchanged')
+    p.add_argument('--cpus', default='0-11', help='CPUs the build container may use, as for docker --cpuset-cpus')
+    p.add_argument('--memory', default='8g', help='memory limit of the build container')
+
+    args = parser.parse_args()
+    if args.command == 'fetch':
+        prepare_sources()
+    elif args.command == 'check':
+        check()
+    elif args.command == 'build':
+        build(args)
+    elif args.command == 'iso':
+        make_iso(args)
+
+
+if __name__ == '__main__':
+    main()

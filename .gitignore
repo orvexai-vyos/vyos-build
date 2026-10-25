@@ -15,3 +15,6 @@ packages/*
 /*.tar
 .DS_Store
 ._.DS_Store
+/scripts/package-build/*/package.orvex.toml
+/scripts/package-build/frr_exporter/frr_exporter/
+/scripts/package-build/udp-broadcast-relay/udp-broadcast-relay/

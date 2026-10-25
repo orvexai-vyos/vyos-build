@@ -195,10 +195,8 @@ RUN wget https://salsa.debian.org/klausenbusk-guest/debootstrap/commit/a9a603b17
 # FPM is used when generation Debian pckages for e.g. Intel QAT drivers
 RUN gem install --no-document fpm
 
-# Add vyos package repo
-COPY vyos-dev.list /etc/apt/sources.list.d/vyos-dev.list
-COPY vyos-dev.key /usr/share/keyrings/vyos-dev-archive-keyring.gpg
-RUN apt-key add /usr/share/keyrings/vyos-dev-archive-keyring.gpg
+# The VyOS circinus repository is not public. Packages built by VyOS are
+# provided at package build time from our own repository instead.
 
 # Packages needed for vyos-1x
 RUN pip install --break-system-packages \
@@ -230,7 +228,6 @@ RUN pip install --break-system-packages \
       python3-passlib \
       python3-tabulate \
       python3-zmq \
-      python3-vici \
       python3-fastapi \
       python3-pyudev \
       python3-systemd \

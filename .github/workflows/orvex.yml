@@ -1,0 +1,102 @@
+name: Build VyOS Stream image from source
+
+on:
+  push:
+    branches:
+      - orvex
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Build only these packages (space separated) and skip the image'
+        required: false
+        default: ''
+
+# A newer push replaces a build that is still running
+concurrency:
+  group: orvex
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Larger than the 2 vCPU default: the kernel and VPP dominate the build time
+  CPUS: 0-15
+  MEMORY: 56g
+
+jobs:
+  # Fails in a minute on a small runner, before the large one is started
+  check:
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/orvex/orvex check
+
+  build:
+    needs: check
+    runs-on: ubicloud-standard-16
+    # Upper bound of what a failed or stuck run can cost
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build container
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          load: true
+          tags: orvex/vyos-build:circinus-2026.03
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Packages that were built by an earlier run are not built again
+      - name: Restore built packages
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/orvex/debs
+            build/orvex/stamps
+          key: orvex-packages-${{ github.run_id }}
+          restore-keys: orvex-packages-
+
+      - name: Build packages
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: scripts/orvex/orvex build --cpus "$CPUS" --memory "$MEMORY" $PACKAGES
+
+      # Also after a failure: what was built is kept, so a retry continues from there
+      - name: Save built packages
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/orvex/debs
+            build/orvex/stamps
+          key: orvex-packages-${{ github.run_id }}
+
+      - name: Build image
+        if: ${{ inputs.packages == '' }}
+        run: scripts/orvex/orvex iso --cpus "$CPUS" --memory "$MEMORY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs
+          path: build/orvex/logs
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload image
+        if: ${{ inputs.packages == '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vyos-stream-2026.03-orvex
+          path: build/orvex/out
+          retention-days: 14
+          if-no-files-found: error
