@@ -1,0 +1,101 @@
+name: Build packages of one stage
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Build container, from the image job
+        type: string
+        required: true
+      args:
+        description: Arguments of "orvex build"
+        type: string
+        required: true
+      stage:
+        description: Name of the stage, used for the cache and artifact names
+        type: string
+        required: true
+      timeout:
+        description: Minutes after which the job is stopped
+        type: number
+        required: true
+      iso:
+        description: Build the image after the packages
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner has little free disk space, a package build needs tens of GB.
+      # The unused tools make room, and Docker keeps its images on the larger /mnt.
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo systemctl stop docker docker.socket
+          sudo mkdir -p /mnt/docker /etc/docker
+          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl start docker
+          df -h / /mnt
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch build container
+        run: |
+          docker pull "${{ inputs.image }}"
+          docker tag "${{ inputs.image }}" orvex/vyos-build:circinus-2026.03
+
+      # The packages of the stage before, and of earlier runs
+      - name: Restore built packages
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/orvex/debs
+            build/orvex/stamps
+          key: orvex-pkgs-none
+          restore-keys: |
+            orvex-pkgs-${{ github.run_id }}-
+            orvex-pkgs-
+
+      - name: Build packages
+        run: scripts/orvex/orvex build --cpus 0-3 --memory 14g ${{ inputs.args }}
+
+      # Also after a failure: what was built is kept, so a retry continues from there
+      - name: Save built packages
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/orvex/debs
+            build/orvex/stamps
+          key: orvex-pkgs-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}
+
+      - name: Build image
+        if: ${{ inputs.iso }}
+        run: scripts/orvex/orvex iso --cpus 0-3 --memory 14g
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ inputs.stage }}
+          path: build/orvex/logs
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload image
+        if: ${{ inputs.iso }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vyos-stream-2026.03-orvex
+          path: build/orvex/out
+          retention-days: 14
+          if-no-files-found: error

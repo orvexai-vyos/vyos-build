@@ -279,7 +279,7 @@ def build(args) -> None:
 
     # Only the packages the user named, or all of them
     for name, workdir, config in plan:
-        if args.packages and name not in args.packages:
+        if (args.packages and name not in args.packages) or name in args.exclude:
             continue
 
         digest = inputs_digest(workdir, config)
@@ -439,6 +439,7 @@ def main():
 
     p = sub.add_parser('build', help='build packages in the build container')
     p.add_argument('packages', nargs='*', help='only these packages (default: all)')
+    p.add_argument('--exclude', nargs='+', default=[], metavar='PKG', help='not these packages')
     p.add_argument('--force', action='store_true', help='rebuild even if the inputs are unchanged')
     p.add_argument('--cpus', default='0-11', help='CPUs the build container may use, as for docker --cpuset-cpus')
     p.add_argument('--memory', default='8g', help='memory limit of the build container')

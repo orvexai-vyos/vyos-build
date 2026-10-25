@@ -7,11 +7,6 @@ on:
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
-    inputs:
-      packages:
-        description: 'Build only these packages (space separated) and skip the image'
-        required: false
-        default: ''
 
 # A newer push replaces a build that is still running
 concurrency:
@@ -22,81 +17,104 @@ permissions:
   contents: read
 
 env:
-  # Larger than the 2 vCPU default: the kernel and VPP dominate the build time
-  CPUS: 0-15
-  MEMORY: 56g
+  IMAGE: ghcr.io/${{ github.repository_owner }}/vyos-build-env
 
+# One job per stage, as a job may run for 6 hours at most. Each stage takes
+# over the packages of the one before it through the cache, and a run that
+# fails continues from there when it is started again.
 jobs:
-  # Fails in a minute on a small runner, before the large one is started
+  # Fails in a minute, before any of the long jobs is started
   check:
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - run: scripts/orvex/orvex check
 
-  build:
+  # The build container, which takes a while to make. Pushed under the hash of
+  # its files, so only a change to them makes it again.
+  image:
     needs: check
-    runs-on: ubicloud-standard-16
-    # Upper bound of what a failed or stuck run can cost
-    timeout-minutes: 300
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
-
+      - id: tag
+        run: echo "tag=${IMAGE}:${{ hashFiles('docker/**') }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: exists
+        run: |
+          if docker manifest inspect "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/setup-buildx-action@v4
-
-      - name: Build container
-        uses: docker/build-push-action@v7
+        if: steps.exists.outputs.found != 'true'
+      - uses: docker/build-push-action@v7
+        if: steps.exists.outputs.found != 'true'
         with:
           context: docker
-          load: true
-          tags: orvex/vyos-build:circinus-2026.03
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: true
+          tags: ${{ steps.tag.outputs.tag }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      # Packages that were built by an earlier run are not built again
-      - name: Restore built packages
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/orvex/debs
-            build/orvex/stamps
-          key: orvex-packages-${{ github.run_id }}
-          restore-keys: orvex-packages-
+  light:
+    name: packages (all but VPP, kernel, vyos-1x)
+    needs: image
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/orvex-stage.yml
+    with:
+      image: ${{ needs.image.outputs.tag }}
+      args: --exclude vpp linux-kernel vyos-1x
+      stage: light
+      timeout: 240
 
-      - name: Build packages
-        env:
-          PACKAGES: ${{ inputs.packages }}
-        run: scripts/orvex/orvex build --cpus "$CPUS" --memory "$MEMORY" $PACKAGES
+  vpp:
+    name: packages (VPP)
+    needs: [image, light]
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/orvex-stage.yml
+    with:
+      image: ${{ needs.image.outputs.tag }}
+      args: vpp
+      stage: vpp
+      timeout: 345
 
-      # Also after a failure: what was built is kept, so a retry continues from there
-      - name: Save built packages
-        if: always()
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            build/orvex/debs
-            build/orvex/stamps
-          key: orvex-packages-${{ github.run_id }}
+  kernel:
+    name: packages (kernel and drivers)
+    needs: [image, vpp]
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/orvex-stage.yml
+    with:
+      image: ${{ needs.image.outputs.tag }}
+      args: linux-kernel
+      stage: kernel
+      timeout: 345
 
-      - name: Build image
-        if: ${{ inputs.packages == '' }}
-        run: scripts/orvex/orvex iso --cpus "$CPUS" --memory "$MEMORY"
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: logs
-          path: build/orvex/logs
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload image
-        if: ${{ inputs.packages == '' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: vyos-stream-2026.03-orvex
-          path: build/orvex/out
-          retention-days: 14
-          if-no-files-found: error
+  iso:
+    name: vyos-1x and image
+    needs: [image, kernel]
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/orvex-stage.yml
+    with:
+      image: ${{ needs.image.outputs.tag }}
+      args: vyos-1x
+      stage: iso
+      timeout: 120
+      iso: true
