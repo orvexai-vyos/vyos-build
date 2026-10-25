@@ -14,6 +14,10 @@ signed_by = "RWTR1ty93Oyontk6caB9WqmiQC4fgeyd/ejgRxCRGd2MQej7nqebHneP"
 # Timestamp in the signature's trusted comment. Used as the commit date of
 # source trees imported from the release, which keeps their commit ids stable.
 epoch = 1773942955
+# The 14 source trees the build takes from the release, kept here as VyOS can
+# remove its download. Made from the verified release, see the release notes.
+trees_url = "https://github.com/orvexai-vyos/vyos-build/releases/download/sources-2026.03/vyos-trees-2026.03.tar.gz"
+trees_sha256 = "3dd8ffe0622fcaefd85da91ada1ea3de0b9f3dc0195a8c9a2e72bdc0cc958adb"
 
 [docker]
 image = "orvex/vyos-build:circinus-2026.03"

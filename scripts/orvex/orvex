@@ -62,27 +62,60 @@ def fetch_release() -> Path:
     return dst
 
 
-def extract_trees(release: Path, wanted: set) -> None:
-    """Extract the named top-level trees of vyos_tarballs.tar.gz in one pass"""
+def fetch_trees() -> Path | None:
+    """The source trees of the release on their own, from our copy. None if it is not available."""
+    stream = LOCK['stream']
+    if 'trees_url' not in stream:
+        return None
+    dst = WORK / 'cache' / os.path.basename(stream['trees_url'])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not (dst.exists() and sha256_of(dst) == stream['trees_sha256']):
+        print(f"I: Downloading {stream['trees_url']}")
+        part = dst.with_name(dst.name + '.part')
+        if subprocess.run(['curl', '-fL', '--retry', '3', '-o', str(part), stream['trees_url']]).returncode != 0:
+            print("W: our copy of the source trees is not available, using the release")
+            return None
+        digest = sha256_of(part)
+        if digest != stream['trees_sha256']:
+            part.unlink()
+            sys.exit(f"E: {dst.name} has sha256 {digest}, lock expects {stream['trees_sha256']}")
+        part.rename(dst)
+    return dst
+
+
+def extract_trees(wanted: set) -> None:
+    """Extract the named top-level source trees of the release"""
     dest = WORK / 'sources/trees'
     missing = {t for t in wanted if not (dest / t).is_dir()}
     if not missing:
         return
-
-    print(f"I: Extracting {len(missing)} source trees from {release.name}")
     dest.mkdir(parents=True, exist_ok=True)
     found = set()
-    with tarfile.open(release, 'r|gz') as outer:
-        for member in outer:
-            if not member.name.endswith('vyos-tarballs/vyos_tarballs.tar.gz'):
-                continue
-            with tarfile.open(fileobj=outer.extractfile(member), mode='r|gz') as inner:
-                for entry in inner:
-                    top = entry.name.removeprefix('./').split('/')[0]
-                    if top in missing:
-                        inner.extract(entry, dest, filter='data')
-                        found.add(top)
-            break
+
+    own = fetch_trees()
+    if own:
+        print(f"I: Extracting {len(missing)} source trees from {own.name}")
+        with tarfile.open(own, 'r|gz') as archive:
+            for entry in archive:
+                top = entry.name.removeprefix('./').split('/')[0]
+                if top in missing:
+                    archive.extract(entry, dest, filter='data')
+                    found.add(top)
+    else:
+        # vyos_tarballs.tar.gz, nested in the release, holds the trees
+        release = fetch_release()
+        print(f"I: Extracting {len(missing)} source trees from {release.name}")
+        with tarfile.open(release, 'r|gz') as outer:
+            for member in outer:
+                if not member.name.endswith('vyos-tarballs/vyos_tarballs.tar.gz'):
+                    continue
+                with tarfile.open(fileobj=outer.extractfile(member), mode='r|gz') as inner:
+                    for entry in inner:
+                        top = entry.name.removeprefix('./').split('/')[0]
+                        if top in missing:
+                            inner.extract(entry, dest, filter='data')
+                            found.add(top)
+                break
 
     if found != missing:
         sys.exit(f"E: not in the release: {', '.join(sorted(missing - found))}")
@@ -128,8 +161,7 @@ def prepare_sources() -> dict:
     trees = dict(LOCK['tree'])
     trees.update({n: e['tree'] for n, e in LOCK['extra'].items() if 'tree' in e})
 
-    release = fetch_release()
-    extract_trees(release, set(trees.values()))
+    extract_trees(set(trees.values()))
 
     sources = {}
     for name, tree in trees.items():
@@ -352,12 +384,19 @@ def check() -> None:
             sys.exit(f"E: {name}: no package entries")
     print(f"I: {len(plan)} packages in the plan")
 
-    url = LOCK['stream']['url']
-    head = run(['curl', '-sIL', '--max-time', '30', '-o', '/dev/null', '-w', '%{http_code} %header{content-length}', url],
-               capture_output=True, text=True).stdout.split()
-    if head[0] != '200':
-        sys.exit(f"E: {url} answers {head[0]}")
-    print(f"I: release available, {int(head[1]) / 1e9:.2f} GB")
+    # Our copy of the trees is enough to build. The release itself is the fallback.
+    stream = LOCK['stream']
+    for what, url in (('source trees', stream.get('trees_url')), ('release', stream['url'])):
+        if not url:
+            continue
+        head = run(['curl', '-sIL', '--max-time', '30', '-o', '/dev/null', '-w', '%{http_code} %header{content-length}', url],
+                   capture_output=True, text=True).stdout.split()
+        if head[0] == '200':
+            print(f"I: {what} available, {int(head[1]) / 1e6:.0f} MB")
+        elif what == 'source trees':
+            sys.exit(f"E: {url} answers {head[0]}")
+        else:
+            print(f"W: {url} answers {head[0]}, the release is not available as a fallback")
 
 
 def assemble_repository() -> Path:
